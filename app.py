@@ -8,7 +8,7 @@ from typing import List, Tuple
 import numpy as np
 import streamlit as st
 from PIL import Image
-
+from streamlit_sortable import sortable
 
 TARGET_W = 900  # 고정 폭
 
@@ -41,8 +41,7 @@ def resize_to_width(img: Image.Image, width: int) -> Image.Image:
 
 
 # -------------------------
-# Spacing analysis from reference detail image
-# (find horizontal white bands)
+# Spacing analysis (reference image)
 # -------------------------
 @dataclass
 class SpacingRule:
@@ -52,18 +51,12 @@ class SpacingRule:
 
 
 def analyze_spacing_from_reference(ref_img: Image.Image) -> SpacingRule:
-    """
-    레퍼런스 상세페이지 이미지에서
-    '거의 흰색' 가로 띠를 찾아
-    상단/중간/하단 여백(px)을 추정.
-    """
     img = ref_img.convert("RGB")
     arr = np.array(img).astype(np.uint8)
     gray = arr.mean(axis=2)
 
     white_thr = 245
     ratio_thr = 0.98
-
     row_white_ratio = (gray > white_thr).mean(axis=1)
 
     runs = []
@@ -85,9 +78,8 @@ def analyze_spacing_from_reference(ref_img: Image.Image) -> SpacingRule:
         if length >= 5:
             runs.append((start, len(row_white_ratio) - 1, length))
 
-    # runs가 적으면 기본값 리턴
+    # fallback: 폭 비율 기본값
     if len(runs) < 2:
-        # fallback: "폭 대비 비율" 기반 기본값(샘플 분석값 기반)
         w = img.size[0]
         return SpacingRule(
             top_px=max(10, int(round(w * 0.25))),
@@ -97,7 +89,6 @@ def analyze_spacing_from_reference(ref_img: Image.Image) -> SpacingRule:
 
     top = runs[0][2]
     bottom = runs[-1][2]
-
     mids = [r[2] for r in runs[1:-1]] or [int(round((top + bottom) / 2))]
     between = int(round(float(np.median(mids))))
 
@@ -105,7 +96,6 @@ def analyze_spacing_from_reference(ref_img: Image.Image) -> SpacingRule:
 
 
 def scale_spacing_to_target(rule: SpacingRule, ref_width: int, target_width: int) -> SpacingRule:
-    """레퍼런스 폭 기준 px 여백을, 목표 폭(900)에 비례 스케일."""
     if ref_width <= 0:
         return rule
     s = target_width / ref_width
@@ -117,7 +107,7 @@ def scale_spacing_to_target(rule: SpacingRule, ref_width: int, target_width: int
 
 
 # -------------------------
-# Build detail image
+# Build detail image (NO crop / NO enhance)
 # -------------------------
 def build_detail_image(
     images: List[Image.Image],
@@ -125,17 +115,11 @@ def build_detail_image(
     out_width: int = TARGET_W,
     background=(255, 255, 255),
 ) -> Image.Image:
-    """
-    업로드된 이미지를 순서대로:
-    - 각 이미지를 폭 900에 맞춰 리사이즈(비율 유지)
-    - 사이사이 흰 여백(between_px)
-    - 최상단/최하단 흰 여백(top/bottom)
-    """
     resized = [resize_to_width(im, out_width) for im in images]
     heights = [im.size[1] for im in resized]
 
     total_h = spacing.top_px + spacing.bottom_px
-    if len(resized) > 0:
+    if resized:
         total_h += sum(heights)
         total_h += spacing.between_px * (len(resized) - 1)
 
@@ -154,25 +138,21 @@ def build_detail_image(
 # -------------------------
 # ZIP handling
 # -------------------------
-def read_images_from_zip(uploaded_zip) -> List[Tuple[str, Image.Image]]:
-    """
-    ZIP 안의 이미지를 'ZIP 내부 순서(ZipInfo 순서)'로 읽음.
-    (업로드 순서 요구에 가장 근접)
-    """
+def read_images_from_zip(uploaded_zip, sort_mode: str) -> List[Tuple[str, Image.Image]]:
     zbytes = uploaded_zip.read()
     zf = zipfile.ZipFile(io.BytesIO(zbytes))
 
+    infos = [i for i in zf.infolist() if (not i.is_dir()) and is_image_file(i.filename)]
+    if sort_mode == "filename":
+        infos.sort(key=lambda x: os.path.basename(x.filename).lower())
+
     items = []
-    for info in zf.infolist():
-        if info.is_dir():
-            continue
-        fn = info.filename
-        if not is_image_file(fn):
-            continue
-        data = zf.read(info)
+    for info in infos:
+        fn = os.path.basename(info.filename)
         try:
+            data = zf.read(info)
             im = pil_open_rgb(data)
-            items.append((os.path.basename(fn), im))
+            items.append((fn, im))
         except Exception:
             continue
 
@@ -180,25 +160,42 @@ def read_images_from_zip(uploaded_zip) -> List[Tuple[str, Image.Image]]:
 
 
 # -------------------------
+# Session state helpers
+# -------------------------
+def ensure_state():
+    if "items" not in st.session_state:
+        # items: list of dict {id, name, img}
+        st.session_state.items = []
+    if "include" not in st.session_state:
+        # include[id] = bool
+        st.session_state.include = {}
+    if "order" not in st.session_state:
+        # order: list of ids
+        st.session_state.order = []
+
+
+def reset_items():
+    st.session_state.items = []
+    st.session_state.include = {}
+    st.session_state.order = []
+
+
+# -------------------------
 # UI
 # -------------------------
-st.set_page_config(layout="wide")
-st.title("미샵 상세페이지 생성기 (폭 900 / 여백 자동 / 왜곡·크롭·보정 금지)")
+st.set_page_config(page_title="미샵 상세페이지 생성기", layout="wide")
+st.title("상세페이지 생성기")
+st.caption("업로드한 이미지를 세로로 배열해 상세페이지용 JPG 1장 생성 (폭 900 / 여백 자동 / 크롭·보정 금지)")
 
-st.markdown(
-    """
-- 업로드한 이미지를 **업로드 순서대로** 세로로 배열해 **상세페이지용 JPG 1장**을 만듭니다.  
-- 각 이미지는 **폭 900으로 비율 유지 리사이즈만** 하며, **크롭/왜곡/보정은 하지 않습니다.**  
-- 이미지 사이/상단/하단 흰 여백은 **레퍼런스 상세페이지 이미지**로부터 자동 분석합니다.
-"""
-)
+ensure_state()
 
-colA, colB = st.columns([1, 1], gap="large")
+# Sidebar (minimal)
+with st.sidebar:
+    st.header("설정")
 
-with colA:
-    st.subheader("1) 여백 기준(레퍼런스) 설정")
+    st.subheader("여백 기준(레퍼런스)")
     ref = st.file_uploader(
-        "레퍼런스 상세페이지 이미지 업로드(권장) — 여백 자동 분석용",
+        "레퍼런스 상세페이지 이미지(선택)",
         type=["jpg", "jpeg", "png", "webp"],
         accept_multiple_files=False,
         key="ref",
@@ -206,105 +203,196 @@ with colA:
 
     if ref:
         ref_img = Image.open(ref).convert("RGB")
-        rule_raw = analyze_spacing_from_reference(ref_img)
-        rule = scale_spacing_to_target(rule_raw, ref_img.size[0], TARGET_W)
-        st.success("레퍼런스 분석 완료!")
-        st.write(f"- (레퍼런스 폭 {ref_img.size[0]} 기준) 상단 {rule_raw.top_px}px / 사이 {rule_raw.between_px}px / 하단 {rule_raw.bottom_px}px")
-        st.write(f"- (900폭 적용) 상단 {rule.top_px}px / 사이 {rule.between_px}px / 하단 {rule.bottom_px}px")
-        st.image(ref_img, caption="레퍼런스 미리보기", width=220)
+        raw = analyze_spacing_from_reference(ref_img)
+        auto = scale_spacing_to_target(raw, ref_img.size[0], TARGET_W)
+        st.success("레퍼런스 분석 완료")
     else:
-        # 샘플 분석 기반 기본 비율 (폭 대비)
-        # top≈0.25W, between≈0.47W, bottom≈0.19W
-        rule = SpacingRule(
+        auto = SpacingRule(
             top_px=int(round(TARGET_W * 0.25)),
             between_px=int(round(TARGET_W * 0.47)),
             bottom_px=int(round(TARGET_W * 0.19)),
         )
-        st.info("레퍼런스를 올리지 않으면, 기본 여백(샘플 기반 비율)로 적용합니다.")
-        st.write(f"- 기본(900폭) 상단 {rule.top_px}px / 사이 {rule.between_px}px / 하단 {rule.bottom_px}px")
+        st.info("레퍼런스 미등록 시 기본 여백 적용")
+
+    st.subheader("여백 미세조정")
+    use_manual = st.toggle("수동 조정", value=False)
+    if use_manual:
+        top_px = st.slider("상단(px)", 0, 600, auto.top_px, 5)
+        between_px = st.slider("사이(px)", 0, 900, auto.between_px, 5)
+        bottom_px = st.slider("하단(px)", 0, 600, auto.bottom_px, 5)
+        spacing = SpacingRule(top_px=top_px, between_px=between_px, bottom_px=bottom_px)
+    else:
+        spacing = auto
 
     st.divider()
-    st.subheader("2) 입력 방식 선택")
-    mode = st.radio("업로드 방식", ["JPG 여러 장 업로드", "ZIP 업로드(자동 압축해제)", "JPG + ZIP 혼합"], horizontal=False)
+    st.subheader("ZIP 정렬")
+    zip_sort_label = st.radio(
+        "ZIP 이미지 순서",
+        ["ZIP 내부 순서(권장)", "파일명 기준 정렬"],
+        index=0,
+    )
+    zip_sort_mode = "zip_order" if "ZIP 내부" in zip_sort_label else "filename"
 
-with colB:
-    st.subheader("3) 이미지 업로드")
-    uploaded_images: List[Tuple[str, Image.Image]] = []
+    st.divider()
+    if st.button("업로드 목록 초기화", use_container_width=True):
+        reset_items()
+        st.rerun()
 
-    if mode in ["JPG 여러 장 업로드", "JPG + ZIP 혼합"]:
+
+# Main layout
+left, right = st.columns([1.2, 0.8], gap="large")
+
+with left:
+    st.subheader("1) 업로드")
+    mode = st.radio("업로드 방식", ["JPG 여러 장", "ZIP 파일", "JPG + ZIP 혼합"], horizontal=True)
+
+    add_btn = st.button("업로드 반영하기", type="primary")
+    st.caption("※ 이미지를 올린 뒤 ‘업로드 반영하기’를 눌러 목록에 추가하세요.")
+
+    jpgs = None
+    zips = None
+    if mode in ["JPG 여러 장", "JPG + ZIP 혼합"]:
         jpgs = st.file_uploader(
-            "JPG(또는 PNG/WebP) 여러 장 업로드 — 업로드 순서대로 정렬",
+            "이미지 업로드(JPG/PNG/WebP)",
             type=["jpg", "jpeg", "png", "webp"],
             accept_multiple_files=True,
             key="jpgs",
         )
-        if jpgs:
-            for f in jpgs:
-                try:
-                    uploaded_images.append((f.name, Image.open(f).convert("RGB")))
-                except Exception:
-                    continue
 
-    if mode in ["ZIP 업로드(자동 압축해제)", "JPG + ZIP 혼합"]:
+    if mode in ["ZIP 파일", "JPG + ZIP 혼합"]:
         zips = st.file_uploader(
-            "ZIP 업로드(여러 개 가능) — ZIP 내부 파일 순서대로 사용",
+            "ZIP 업로드(자동 압축 해제)",
             type=["zip"],
             accept_multiple_files=True,
             key="zips",
         )
+
+    if add_btn:
+        new_items = []
+
+        if jpgs:
+            for f in jpgs:
+                try:
+                    img = Image.open(f).convert("RGB")
+                    new_items.append((f.name, img))
+                except Exception:
+                    continue
+
         if zips:
             for z in zips:
-                for fn, im in read_images_from_zip(z):
-                    uploaded_images.append((fn, im))
+                new_items.extend(read_images_from_zip(z, sort_mode=zip_sort_mode))
 
-    if not uploaded_images:
-        st.warning("이미지를 업로드하면 여기서 생성/다운로드가 활성화됩니다.")
-    else:
-        st.success(f"총 {len(uploaded_images)}장 업로드 완료")
+        # append into session
+        if new_items:
+            for fn, img in new_items:
+                # unique id
+                uid = f"{len(st.session_state.items)+1:04d}_{safe_base(fn)}"
+                st.session_state.items.append({"id": uid, "name": fn, "img": img})
+                st.session_state.include[uid] = True
+                st.session_state.order.append(uid)
 
-        # 미리보기(업로드 순서)
-        st.subheader("업로드 순서 미리보기(상위 12장)")
-        previews = [resize_to_width(im, 300) for _, im in uploaded_images[:12]]
-        st.image(previews, width=150)
+            st.success(f"추가 완료: {len(new_items)}장")
+            st.rerun()
+        else:
+            st.warning("추가할 이미지가 없습니다. 업로드 후 다시 눌러주세요.")
 
+    if st.session_state.items:
         st.divider()
-        st.subheader("4) 생성 및 다운로드")
+        st.subheader("2) 순서 변경 + 제외 선택")
 
-        # 파일명 규칙: 업로드한 파일명을 이용
-        # - ZIP만 업로드: zip 이름을 쓰고 싶지만, 혼합/다중 zip도 있어서
-        #   기본은 첫 이미지 파일명 기반으로 생성
-        base_name = safe_base(uploaded_images[0][0])
-        out_name = f"{base_name}_detail_900.jpg"
+        # ---- Drag sortable list ----
+        # show labels with hidden id
+        id_to_name = {it["id"]: it["name"] for it in st.session_state.items}
+        current_ids = st.session_state.order[:]
 
-        if st.button("상세페이지 이미지 생성", type="primary"):
-            imgs_only = [im for _, im in uploaded_images]
-            detail = build_detail_image(imgs_only, spacing=rule, out_width=TARGET_W)
+        labels = [f"{i+1:02d}. {id_to_name[_id]}  ⟪{_id}⟫" for i, _id in enumerate(current_ids)]
+        reordered_labels = sortable(labels, direction="vertical", key="sortable_list")
 
-            st.success("생성 완료!")
-            st.write(f"- 결과 크기: {detail.size[0]} × {detail.size[1]} px")
-            st.image(detail, caption="결과 미리보기(축소)", width=260)
+        # parse ids back
+        new_order = []
+        for lb in reordered_labels:
+            m = re.search(r"⟪(.+?)⟫$", lb)
+            if m:
+                new_order.append(m.group(1))
 
-            # 단일 JPG 다운로드
-            buf = io.BytesIO()
-            detail.save(buf, format="JPEG", quality=95)
-            buf.seek(0)
+        # if changed, update
+        if new_order and new_order != st.session_state.order:
+            st.session_state.order = new_order
 
-            st.download_button(
-                "JPG 다운로드",
-                data=buf,
-                file_name=out_name,
-                mime="image/jpeg",
-            )
+        # ---- Exclude checkboxes with thumbnail grid ----
+        st.caption("아래에서 특정 컷은 체크 해제하면 제외됩니다.")
+        cols = st.columns(4)
+        # build id->item
+        id_to_item = {it["id"]: it for it in st.session_state.items}
 
-            # 여러 작업을 대비해 "한꺼번에" ZIP 다운로드도 제공(현재는 1개지만 규격 맞춤)
-            zbuf = io.BytesIO()
-            with zipfile.ZipFile(zbuf, "w", zipfile.ZIP_DEFLATED) as zf:
-                zf.writestr(out_name, buf.getvalue())
-            zbuf.seek(0)
+        for idx, _id in enumerate(st.session_state.order):
+            it = id_to_item[_id]
+            with cols[idx % 4]:
+                # small preview
+                prev = resize_to_width(it["img"], 220)
+                st.image(prev, use_container_width=True)
+                st.checkbox(
+                    f"포함 ({it['name']})",
+                    value=st.session_state.include.get(_id, True),
+                    key=f"inc_{_id}",
+                    on_change=lambda _id=_id: st.session_state.include.__setitem__(_id, st.session_state[f"inc_{_id}"]),
+                )
 
-            st.download_button(
-                "ZIP으로 한꺼번에 다운로드",
-                data=zbuf,
-                file_name=f"{base_name}_outputs.zip",
-                mime="application/zip",
-            )
+        included_count = sum(1 for _id in st.session_state.order if st.session_state.include.get(_id, True))
+        st.info(f"현재 포함: {included_count}장 / 전체: {len(st.session_state.order)}장")
+
+    else:
+        st.info("아직 업로드된 이미지가 없습니다.")
+
+with right:
+    st.subheader("3) 생성 & 다운로드")
+    st.write("**출력 규칙**")
+    st.write(f"- 폭: **{TARGET_W}px 고정**")
+    st.write("- 크롭/보정/왜곡: **없음** (비율 유지 리사이즈만)")
+    st.write(f"- 여백: 상단 {spacing.top_px}px / 사이 {spacing.between_px}px / 하단 {spacing.bottom_px}px")
+
+    if not st.session_state.items:
+        st.info("왼쪽에서 이미지를 업로드하세요.")
+    else:
+        id_to_item = {it["id"]: it for it in st.session_state.items}
+        selected_ids = [_id for _id in st.session_state.order if st.session_state.include.get(_id, True)]
+
+        if not selected_ids:
+            st.warning("포함된 이미지가 없습니다. 체크를 켜주세요.")
+        else:
+            base_name = safe_base(id_to_item[selected_ids[0]]["name"])
+            out_name = f"{base_name}_detail_900.jpg"
+
+            if st.button("상세페이지 이미지 생성", type="primary", use_container_width=True):
+                with st.spinner("생성 중…"):
+                    imgs = [id_to_item[_id]["img"] for _id in selected_ids]
+                    detail = build_detail_image(imgs, spacing=spacing, out_width=TARGET_W)
+
+                st.success("생성 완료!")
+                st.write(f"결과 크기: **{detail.size[0]} × {detail.size[1]} px**")
+                st.image(detail, caption="미리보기(축소)", width=320)
+
+                buf = io.BytesIO()
+                detail.save(buf, format="JPEG", quality=95)
+                buf.seek(0)
+
+                st.download_button(
+                    "JPG 다운로드",
+                    data=buf,
+                    file_name=out_name,
+                    mime="image/jpeg",
+                    use_container_width=True,
+                )
+
+                zbuf = io.BytesIO()
+                with zipfile.ZipFile(zbuf, "w", zipfile.ZIP_DEFLATED) as zf:
+                    zf.writestr(out_name, buf.getvalue())
+                zbuf.seek(0)
+
+                st.download_button(
+                    "ZIP으로 다운로드",
+                    data=zbuf,
+                    file_name=f"{base_name}_outputs.zip",
+                    mime="application/zip",
+                    use_container_width=True,
+                )
