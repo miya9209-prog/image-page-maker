@@ -151,34 +151,31 @@ def read_images_from_zip(uploaded_zip, sort_mode: str) -> List[Tuple[str, Image.
 
 
 # -------------------------
-# Session State
+# Session State  (IMPORTANT: avoid key name 'items')
 # -------------------------
 def ensure_state():
-    if "items" not in st.session_state:
-        # items: list of dict {id, name, img}
-        st.session_state.items = []
-    if "include" not in st.session_state:
-        # include[id] = bool
-        st.session_state.include = {}
-    if "last_upload_sig" not in st.session_state:
-        st.session_state.last_upload_sig = ""
+    if "img_items" not in st.session_state:
+        # list of dict {id, name, img}
+        st.session_state["img_items"] = []
+    if "img_include" not in st.session_state:
+        # dict: id -> bool
+        st.session_state["img_include"] = {}
 
 
 def reset_items():
-    st.session_state.items = []
-    st.session_state.include = {}
-    st.session_state.last_upload_sig = ""
+    st.session_state["img_items"] = []
+    st.session_state["img_include"] = {}
 
 
 def add_item(name: str, img: Image.Image):
-    uid = f"{len(st.session_state.items)+1:04d}_{safe_base(name)}"
-    st.session_state.items.append({"id": uid, "name": name, "img": img})
-    st.session_state.include[uid] = True
+    uid = f"{len(st.session_state['img_items'])+1:04d}_{safe_base(name)}"
+    st.session_state["img_items"].append({"id": uid, "name": name, "img": img})
+    st.session_state["img_include"][uid] = True
 
 
 def move_item(index: int, direction: int):
     """direction: -1 (up), +1 (down)"""
-    items = st.session_state.items
+    items = st.session_state["img_items"]
     j = index + direction
     if j < 0 or j >= len(items):
         return
@@ -194,7 +191,7 @@ st.caption("폭 900 고정 · 업로드 순서 배열 · 여백 자동 · 크롭
 
 ensure_state()
 
-# ---- Sidebar: Settings (minimal) ----
+# ---- Sidebar: Settings ----
 with st.sidebar:
     st.header("설정")
 
@@ -291,13 +288,13 @@ with tab1:
                 st.warning("추가할 이미지가 없습니다.")
 
     with colB:
-        st.metric("현재 업로드", f"{len(st.session_state.items)} 장")
+        st.metric("현재 업로드", f"{len(st.session_state['img_items'])} 장")
 
-    if st.session_state.items:
+    if st.session_state["img_items"]:
         st.divider()
         st.subheader("업로드 미리보기 (최대 12장)")
-        preview_count = min(12, len(st.session_state.items))
-        previews = [resize_to_width(it["img"], 300) for it in st.session_state.items[:preview_count]]
+        preview_count = min(12, len(st.session_state["img_items"]))
+        previews = [resize_to_width(it["img"], 300) for it in st.session_state["img_items"][:preview_count]]
         st.image(previews, width=140)
     else:
         st.info("이미지를 업로드하고 ‘업로드 반영하기’를 눌러주세요.")
@@ -305,35 +302,34 @@ with tab1:
 with tab2:
     st.subheader("2) 순서 변경 / 제외 / 생성")
 
-    if not st.session_state.items:
+    items = st.session_state["img_items"]
+    include = st.session_state["img_include"]
+
+    if not items:
         st.info("먼저 업로드 탭에서 이미지를 추가하세요.")
     else:
-        # list UI
         st.caption("⬆⬇ 버튼으로 순서를 조정하고, 체크를 끄면 해당 컷은 제외됩니다.")
-        items = st.session_state.items
 
-        # compact header
         top_row = st.columns([1, 1, 1])
         with top_row[0]:
             if st.button("전체 포함", use_container_width=True):
                 for it in items:
-                    st.session_state.include[it["id"]] = True
+                    include[it["id"]] = True
                 st.rerun()
         with top_row[1]:
             if st.button("전체 제외", use_container_width=True):
                 for it in items:
-                    st.session_state.include[it["id"]] = False
+                    include[it["id"]] = False
                 st.rerun()
         with top_row[2]:
-            st.write(f"포함: **{sum(1 for it in items if st.session_state.include.get(it['id'], True))} / {len(items)}**")
+            st.write(f"포함: **{sum(1 for it in items if include.get(it['id'], True))} / {len(items)}**")
 
         st.divider()
 
-        # item cards
         for idx, it in enumerate(items):
             uid = it["id"]
             name = it["name"]
-            inc = st.session_state.include.get(uid, True)
+            inc = include.get(uid, True)
 
             row = st.columns([0.14, 0.56, 0.15, 0.15])
             with row[0]:
@@ -343,7 +339,7 @@ with tab2:
                 st.write(f"**{idx+1:02d}. {name}**")
                 st.caption(f"{it['img'].size[0]}×{it['img'].size[1]}")
                 st.checkbox("포함", value=inc, key=f"inc_{uid}")
-                st.session_state.include[uid] = st.session_state[f"inc_{uid}"]
+                include[uid] = st.session_state[f"inc_{uid}"]
             with row[2]:
                 st.write("")
                 if st.button("⬆ 위로", key=f"up_{uid}", use_container_width=True, disabled=(idx == 0)):
@@ -355,16 +351,14 @@ with tab2:
             with row[3]:
                 st.write("")
                 if st.button("삭제", key=f"del_{uid}", use_container_width=True):
-                    # delete item
-                    st.session_state.items = [x for x in st.session_state.items if x["id"] != uid]
-                    if uid in st.session_state.include:
-                        del st.session_state.include[uid]
+                    st.session_state["img_items"] = [x for x in items if x["id"] != uid]
+                    if uid in include:
+                        del include[uid]
                     st.rerun()
 
             st.markdown("---")
 
-        # Generate area
-        selected = [it for it in st.session_state.items if st.session_state.include.get(it["id"], True)]
+        selected = [it for it in st.session_state["img_items"] if include.get(it["id"], True)]
 
         st.subheader("3) 다운로드")
         st.write(f"- 폭: **{TARGET_W}px**")
