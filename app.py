@@ -183,7 +183,7 @@ def read_images_from_zip(uploaded_zip) -> List[Tuple[str, Image.Image]]:
 # UI
 # -------------------------
 st.set_page_config(layout="wide")
-st.title("미샵 상세페이지 생성기 (폭 900 / 여백 자동 / 왜곡·크롭·보정 금지)")
+st.title(미샵 상세페이지 생성기)
 
 st.markdown(
     """
